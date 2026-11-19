@@ -140,10 +140,10 @@ RISE_FRAC = {
     "side": 0.08, "grind": 0.02,
 }
 CLASSES = {
-    "platinum":  (0.008, 0.0008, 0.0000, 0.020),
+    "platinum":  (0.008, 0.0006, 0.0000, 0.020),
     "completion": (0.010, 0.0007, 0.0000, 0.020),
     "first":     (1.000, 0.0000, 1.0000, 0.9999),
-    "ch1":       (0.70,  0.0085, 0.0034, 0.55),
+    "ch1":       (0.70,  0.0116, 0.0034, 0.55),
     "ch2":       (0.60,  0.0050, 0.0006, 0.45),
     "ch3":       (0.55,  0.0045, 0.0006, 0.45),
     "ch4":       (0.50,  0.0040, 0.0006, 0.45),
@@ -363,17 +363,32 @@ class History(object):
                 gaps.append(g)
         self.gap_obs = median(gaps) if gaps else None
 
+        # lambda_H: runtime hazard calibration from the marginal trophies
+        # per new player (m-bar) at the last observed refresh. Elasticity
+        # (m-bar - 1) ~ lambda_H^0.75, log-space shrinkage w = 0.65
+        # toward 1.0, floor 0.55. With only the first refresh observed,
+        # m-bar is ~1.03 both ways and lambda_H stays ~1.0; it bites
+        # when refresh 2 lands with a different m-bar.
+        self.lam_h = 1.0
+        if self.jumps:
+            m_obs = sum(self.jumps[-1][3])
+            m_pred = sum(self.rho0)
+            if m_pred > 1.0 and m_obs > 1.0:
+                raw = ((m_obs - 1.0) / (m_pred - 1.0)) ** (1.0 / 0.75)
+                self.lam_h = max(0.55, raw ** 0.65)
+
     # -- blended parameters (log space) ------------------------------------
 
     def hazard(self, i):
-        """Per-trophy progression speed, fit blended with prior."""
+        """Per-trophy progression speed, fit blended with prior, times
+        the runtime lambda_H calibration."""
         hp = self.h_prior[i]
         hf = self.h_fit[i]
         if hf is None or self.w_haz <= 0:
-            return hp
+            return hp * self.lam_h
         hf = max(hf, 1e-6)
         lh = self.w_haz * math.log(hf) + (1.0 - self.w_haz) * math.log(max(hp, 1e-9))
-        return math.exp(lh)
+        return math.exp(lh) * self.lam_h
 
     def rho_base(self, i):
         """New-cohort rate at arrival, observed value blended with prior."""
@@ -433,7 +448,12 @@ def simulate(hist, horizon_h, gap_mul, grow_mul, haz_mul):
     n = hist.n
     t0 = hist.t_last if hist.t_last is not None else hist.release
     n_cur = hist.n_last if hist.n_last else 638.0
-    # cohorts: list of [size, [holders per trophy]]
+    # cohorts: list of [size, [holders per trophy]]. The holders are
+    # real tracked players (the reviewers among them count toward the
+    # rate); decontamination lives in the calibration -- rho0 and the
+    # hazard come from the new-cohort rate and same-N growth, never
+    # from the contaminated launch-night count -- not in the holder
+    # count itself.
     cohorts = [[n_cur, [hist.r_last[i] * n_cur for i in range(n)]]]
     haz = [hist.hazard(i) * haz_mul for i in range(n)]
 
@@ -475,7 +495,11 @@ def simulate(hist, horizon_h, gap_mul, grow_mul, haz_mul):
     prior_ratios = [6.06, 1.60, 1.42, 1.34, 1.29, 1.25, 1.21, 1.18, 1.15]
     jump_idx = len(hist.jumps) + missed
     n_start = n_cur
-    n_cap = n_start * 5.0
+    # Player-count ceiling: the Weibull saturation level N_inf is
+    # log-uniform 28-60k and N7 ~ 43k (external-AI consensus, round 2),
+    # so the cap is 60,000 -- not a multiple of n_last. The old 5x cap
+    # stopped N at 19k, far below the consensus N7.
+    n_cap = 60000.0
     first_jump_done = bool(hist.jumps)
 
     steps = int(math.ceil(horizon_h))
@@ -513,9 +537,9 @@ def simulate(hist, horizon_h, gap_mul, grow_mul, haz_mul):
             else:
                 ratio = ratio_prior
             ratio = 1.0 + (ratio - 1.0) * grow_mul
-            # The 5x cap is on extrapolated growth. The first refresh is
-            # a spec fact (6.06x), not an extrapolation, so it is exempt;
-            # once it lands, the cap is 5x the new player count.
+            # The ceiling is the Weibull saturation level (60k). The first
+            # refresh is a spec fact (6.06x), not an extrapolation, so it
+            # is exempt from the cap check; later jumps are capped.
             if first_jump_done and n_cur * ratio > n_cap:
                 ratio = n_cap / n_cur if n_cur > 0 else 1.0
             if ratio > 1.0:
@@ -529,7 +553,6 @@ def simulate(hist, horizon_h, gap_mul, grow_mul, haz_mul):
                 nxt += gap * 3600.0
                 if not first_jump_done:
                     first_jump_done = True
-                    n_cap = n_cur * 5.0
             progress(dt - f)
         else:
             progress(dt)
@@ -591,6 +614,105 @@ def wmean(pairs):
     return sum(v * w for v, w in pairs) / tot
 
 
+def theta_of(cls):
+    """Implied play-hour threshold (half-life) for a class, from its
+    prior hazard. A player plays ~4h per 24h of calendar time, so the
+    play hours in one calendar half-life (ln2/h) are ln2/(6h). The
+    opening trophy has no hazard (theta 0): it is the easiest there is.
+    """
+    h = CLASSES[cls][1]
+    if h <= 0:
+        return 0.0
+    return math.log(2.0) / (6.0 * h)
+
+
+def theta_of_hist(hist, i):
+    """Implied play-hour threshold for one trophy, from its fitted
+    hazard (fit blended with prior). The fitted hazard -- not the class
+    prior -- decides the difficulty order: in a world where fishing
+    progresses faster than Chapter 1, fishing is the easier trophy
+    there, and PAVA must not pool them the other way round."""
+    h = hist.hazard(i)
+    if h <= 0:
+        return 0.0
+    return math.log(2.0) / (6.0 * h)
+
+
+def pava_decreasing(vals):
+    """Isotonic fit: the largest non-increasing sequence <= vals in the
+    least-squares sense (Pool Adjacent Violators Algorithm). Blocks that
+    rise are pooled and averaged, so no trophy can sit alone at an
+    implausible value and no difficulty order can invert."""
+    blocks = []  # each [sum, count]
+    for v in vals:
+        blocks.append([v, 1])
+        while len(blocks) >= 2:
+            a = blocks[-2][0] / blocks[-2][1]
+            b = blocks[-1][0] / blocks[-1][1]
+            if a < b:  # violation: it rises where it must fall
+                s = blocks[-2][0] + blocks[-1][0]
+                c = blocks[-2][1] + blocks[-1][1]
+                blocks.pop()
+                blocks.pop()
+                blocks.append([s, c])
+            else:
+                break
+    out = []
+    for s, c in blocks:
+        out.extend([s / c] * c)
+    return out
+
+
+def gamma_survival(x, k, scale):
+    """P(X > x) for X ~ Gamma(shape k, scale), by Simpson integration.
+
+    No incomplete-gamma in the stdlib, so the tail is integrated
+    numerically (the density is smooth and the tail past x + 60h is
+    negligible for the refresh intervals we care about).
+    """
+    if x <= 0:
+        return 1.0
+    import math as _m
+    lo = x
+    hi = x + 60.0
+    n = 1200  # even
+    h = (hi - lo) / n
+    gk = _m.gamma(k)
+    def pdf(t):
+        if t <= 0:
+            return 0.0
+        return (t ** (k - 1.0)) * _m.exp(-t / scale) / (gk * (scale ** k))
+    s = pdf(lo) + pdf(hi)
+    for j in range(1, n):
+        w = 4.0 if j % 2 == 1 else 2.0
+        s += w * pdf(lo + j * h)
+    return clamp(s * h / 3.0, 0.0, 1.0)
+
+
+def norm_cdf(z):
+    """Standard normal CDF via erf."""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def mixture_quantile(mu0, s0, mu1, s1, p0, tau):
+    """Quantile of a 2-component Gaussian mixture on the logit scale,
+    by 30-iteration bisection of the mixture CDF. Do NOT average the
+    quantiles linearly: the mixture is bimodal."""
+    lo = min(mu0, mu1) - 10.0 * max(s0, s1) - 1.0
+    hi = max(mu0, mu1) + 10.0 * max(s0, s1) + 1.0
+
+    def cdf(x):
+        return p0 * norm_cdf((x - mu0) / s0) + (1.0 - p0) * norm_cdf((x - mu1) / s1)
+
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+        if cdf(mid) < tau:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
 def forecast(case):
     """Return the list of [q05, q25, q50, q75, q95] (percent) per trophy."""
     hist = History(case)
@@ -604,34 +726,50 @@ def forecast(case):
         rates, _n = simulate(hist, horizon_h, gm, gr, hm)
         scen_rates.append(rates)
         scen_w.append(1.0)
-    # Short horizon (<= 6h): mix in a "no refresh" branch. The next
-    # refresh is scheduled, not random, so its weight is the probability
-    # that the scheduled refresh lands after the target (normal schedule
-    # uncertainty, sigma = 1h). At long horizon a refresh is certain and
-    # the branch vanishes.
-    p_nr = 0.0
-    if horizon_h <= 6.0:
+    # Short horizon (<= 6h): the answer is a 2-component Gaussian
+    # mixture on the logit scale -- a locked branch (no refresh yet,
+    # sigma0 = 0.012, centred on the last rate) and a 1-refresh branch.
+    # The no-refresh weight p0 comes from a Gamma renewal process
+    # (shape k = 2.5, mean interval 6.5h), not a Poisson: it is the
+    # probability that no refresh lands in the horizon given the time
+    # since the last refresh. At long horizon a refresh is certain and
+    # the mixture is not used.
+    short = horizon_h <= 6.0
+    p0 = 0.0
+    if short:
         t0 = hist.t_last if hist.t_last is not None else hist.release
         target_t = t0.timestamp() + horizon_h * 3600.0
         if hist.jumps:
-            gap = hist.gap_obs if hist.gap_obs else 10.0
-            t_exp = hist.n_refresh_times[-1].timestamp() + gap * 3600.0
-            if t_exp <= t0.timestamp():
-                t_exp = t0.timestamp() + gap * 3600.0
+            # Subsequent refreshes are a renewal process: Gamma(k = 2.5,
+            # mean interval 6.5h). p0 is the probability that no refresh
+            # lands in the horizon given the time since the last one.
+            t_since = (t0 - hist.n_refresh_times[-1]).total_seconds() / 3600.0
+            t_since = max(t_since, 0.0)
+            s_a = gamma_survival(t_since, 2.5, 2.6)
+            s_b = gamma_survival(t_since + horizon_h, 2.5, 2.6)
+            p0 = clamp(s_b / s_a if s_a > 1e-9 else 0.0, 0.02, 0.9)
         else:
+            # The first refresh is scheduled (~4.5h after release), not
+            # a renewal event: p0 is the probability that the scheduled
+            # refresh lands after the target (normal, sigma = 0.5h -- the
+            # release+4.5h timing is well established). The Gamma renewal
+            # overstates it (it would flip the median to the no-refresh
+            # branch even though the refresh is due).
             t_exp = hist.release.timestamp() + 4.5 * 3600.0
-        sigma = 3600.0
-        z = (target_t - t_exp) / (sigma * math.sqrt(2.0))
-        p_nr = 0.5 * math.erfc(z)
-        p_nr = clamp(p_nr, 0.02, 0.9)
-        if p_nr > 0.02:
-            scen_rates.append(list(hist.r_last))
-            scen_w.append(p_nr / (1.0 - p_nr) * len(SCENARIOS))
+            sigma = 1800.0
+            z = (target_t - t_exp) / (sigma * math.sqrt(2.0))
+            p0 = clamp(0.5 * math.erfc(z), 0.02, 0.9)
     n = hist.n
-    out = []
+    # Per-trophy quantiles in logit space, before the guardrail.
+    # Short horizon: the 2-component Gaussian mixture (locked branch
+    # sigma0 = 0.012 at the last rate; 1-refresh branch from the
+    # scenarios), quantiles by 30-iteration bisection of the mixture CDF.
+    # Long horizon: median + symmetric spread.
+    qlist = []
+    taus = (0.05, 0.25, 0.5, 0.75, 0.95)
     for i in range(n):
         pairs = [(logit(sr[i]), w) for sr, w in zip(scen_rates, scen_w)]
-        med_lg = wmedian(pairs)
+        m = wmedian(pairs)
         mu = wmean(pairs)
         disp = math.sqrt(wmean([( (x - mu) ** 2, w) for x, w in pairs]))
         s = math.sqrt(disp * disp + (0.5 * math.sqrt(days)) ** 2 + 0.25 ** 2)
@@ -646,12 +784,62 @@ def forecast(case):
             if days >= 1.0:
                 # widen just enough that q05 lands near 98%
                 s2 = max(s2, (logit(0.994) - logit(0.98)) / 1.6448536269514722)
-            qs = [inv_logit(logit(med) + z * s2) for z in Z]
+            qlist.append([logit(med) + z * s2 for z in Z])
+        elif short:
+            mu0 = logit(hist.r_last[i])
+            s0 = 0.012
+            mu1 = m
+            s1 = clamp(disp, 0.05, 1.5)
+            qlist.append([mixture_quantile(mu0, s0, mu1, s1, p0, tau)
+                          for tau in taus])
         else:
-            qs = [inv_logit(med_lg + z * s) for z in Z]
+            qlist.append([m + z * s for z in Z])
+    # ---- Post-ensemble guardrail (last line before writing output) ----
+    # (a) Physical lower bounds. A trophy whose threshold is short
+    # (theta <= 35h) must, by day 2, already have progressed past
+    # dilution: its median cannot sit below the last observed rate.
+    med_lg = [qlist[i][2] for i in range(n)]
+    for i in range(n):
+        cls = hist.classes[i]
+        if cls == "first":
+            continue
+        if days >= 2.0 and theta_of_hist(hist, i) <= 35.0:
+            floor_lg = logit(hist.r_last[i])
+            if med_lg[i] < floor_lg:
+                med_lg[i] = floor_lg
+    # (b) Isotonic regression (PAVA) on the median logits, ordered by
+    # difficulty (theta, then the last rate, easiest first). An easier
+    # trophy must not end up with a lower median than a harder one: most
+    # final-score failures are a single trophy leaking 3+ points.
+    # Long horizon only: at short horizon the rate order follows how
+    # quickly an activity is done (fishing first), not the play-hour
+    # threshold, so PAVA would pool the wrong trophies.
+    # The whole quantile vector shifts with the median, so the shape
+    # (the mixture's bimodality at short horizon) is preserved.
+    if days >= 2.0:
+        order = sorted(range(n),
+                       key=lambda i: (theta_of_hist(hist, i), -hist.r_last[i]))
+        ordered_med = pava_decreasing([med_lg[i] for i in order])
+        for k, i in enumerate(order):
+            shift = ordered_med[k] - med_lg[i]
+            if shift != 0.0:
+                qlist[i] = [q + shift for q in qlist[i]]
+    # ---- Rates, then the q95 physical floor ----
+    n_last = hist.n_last if hist.n_last else 638.0
+    out = []
+    for i in range(n):
+        qs = [inv_logit(q) for q in qlist[i]]
         cap = hist.cap[i]
         qs = [min(q, cap) for q in qs]
         qs = [clamp(q, 0.0001, 0.9999) for q in qs]
+        # q95 floor: a trophy that already has E_last holders cannot fall
+        # below E_last/N_max even if the population grows to the Weibull
+        # ceiling N_max = 110,000 and nobody new earns it.
+        e_last = hist.r_last[i] * n_last
+        if e_last >= 1.0:
+            q95_floor = e_last / 110000.0
+            if qs[4] < q95_floor:
+                qs[4] = q95_floor
         qs = sorted(qs)
         out.append([round(q * 100.0, 4) for q in qs])
     return out
