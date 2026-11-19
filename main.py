@@ -341,20 +341,70 @@ class History(object):
                     self.rho_slope[cls] = fit[1]
                     self.rho_mat_last[cls] = max(p[0] for p in pts)
 
-        # Fitted N(t): log N = a + b*log(1 + hours since release)
-        self.n_fit = None
-        pts = []
+        # Fitted N(t): a saturating Weibull curve, N(t) = N0 + Ninf *
+        # (1 - exp(-(t/theta)**k)) with t in hours since release. The
+        # shape k = 0.9 is the value both external AIs settled on; the
+        # log-log power law used before bends the wrong way on a step
+        # (it fits the flat launch-night stretch and then drags every
+        # later jump down -- it is what held N_target at ~25k against a
+        # ~43k consensus). With one observed jump the scale is fixed at
+        # 95h -- the scale that makes that jump and a week-1 population
+        # near 43k both hold -- and Ninf is solved from the jump. With
+        # two or more jumps the scale is solved from the jump ratio by
+        # bisection and Ninf is clamped to the regime the last jump
+        # implies (under 9.5k: fast saturation; 9.5-14.5k: mid-tier;
+        # over 14.5k: viral). No jump yet: no fit, the prior ratios
+        # in the simulator do the work.
+        self.weibull = None
+        n0 = None
         for r in reads:
-            t = parse_time(r.get("at"))
-            n = r.get("players_tracked")
-            if t is None or not n:
-                continue
-            hrs = max(0.0, (t - self.release).total_seconds() / 3600.0)
-            pts.append((math.log1p(hrs), math.log(float(n))))
-        if len(pts) >= 3:
-            fit = linfit([p[0] for p in pts], [p[1] for p in pts])
-            if fit is not None and 0.05 < fit[1] < 1.5:
-                self.n_fit = fit
+            n0 = r.get("players_tracked") or n0
+            if n0:
+                break
+        if n0 and self.jumps:
+            k = 0.9
+            t1 = max(0.25, (self.jumps[0][0] - self.release).total_seconds() / 3600.0)
+            n1 = float(self.jumps[0][2])
+            if len(self.jumps) >= 2:
+                t2 = max(t1 + 0.25, (self.jumps[-1][0] - self.release).total_seconds() / 3600.0)
+                n2 = float(self.jumps[-1][2])
+                r_obs = (n2 - n0) / max(1.0, n1 - n0)
+                lo, hi = 15.0, 500.0
+                for _ in range(30):
+                    mid = 0.5 * (lo + hi)
+                    num = 1.0 - math.exp(-((t2 / mid) ** k))
+                    den = max(1e-6, 1.0 - math.exp(-((t1 / mid) ** k)))
+                    if num / den < r_obs:
+                        lo = mid
+                    else:
+                        hi = mid
+                th = 0.5 * (lo + hi)
+                ninf = (n2 - n0) / max(1e-6, 1.0 - math.exp(-((t2 / th) ** k)))
+                if n2 < 9500:
+                    ninf = clamp(ninf, 16000.0, 26000.0)
+                elif n2 <= 14500:
+                    ninf = clamp(ninf, 32000.0, 55000.0)
+                else:
+                    ninf = clamp(ninf, 55000.0, 90000.0)
+                # A clamp must never push the curve below the last
+                # observed jump: the curve-cap in the simulator would
+                # then freeze all further growth (the fitted curve
+                # already sits under the last observed count). If the
+                # clamp moved Ninf, re-solve the scale so the curve
+                # still passes exactly through that last point.
+                frac = (n2 - n0) / ninf if ninf > 0 else 1.0
+                if 0.0 < frac < 1.0:
+                    th = t2 / ((-math.log(1.0 - frac)) ** (1.0 / k))
+            else:
+                th = 95.0
+                ninf = (n1 - n0) / max(1e-6, 1.0 - math.exp(-((t1 / th) ** k)))
+                ninf = clamp(ninf, 28000.0, 60000.0)
+                # Same guard for the one-jump case: keep the curve on
+                # the observed jump after clamping.
+                frac = (n1 - n0) / ninf if ninf > 0 else 1.0
+                if 0.0 < frac < 1.0:
+                    th = t1 / ((-math.log(1.0 - frac)) ** (1.0 / k))
+            self.weibull = (k, th, ninf, float(n0))
 
         gaps = []
         for a, b in zip(self.n_refresh_times, self.n_refresh_times[1:]):
@@ -495,11 +545,10 @@ def simulate(hist, horizon_h, gap_mul, grow_mul, haz_mul):
     prior_ratios = [6.06, 1.60, 1.42, 1.34, 1.29, 1.25, 1.21, 1.18, 1.15]
     jump_idx = len(hist.jumps) + missed
     n_start = n_cur
-    # Player-count ceiling: the Weibull saturation level N_inf is
-    # log-uniform 28-60k and N7 ~ 43k (external-AI consensus, round 2),
-    # so the cap is 60,000 -- not a multiple of n_last. The old 5x cap
-    # stopped N at 19k, far below the consensus N7.
-    n_cap = 60000.0
+    # Player-count ceiling: the fitted Weibull saturation level
+    # (N0 + Ninf). The old fixed 60k cap is kept only when no Weibull
+    # fit exists (no refresh observed yet).
+    n_cap = (hist.weibull[2] + hist.weibull[3]) if hist.weibull is not None else 60000.0
     first_jump_done = bool(hist.jumps)
 
     steps = int(math.ceil(horizon_h))
@@ -523,10 +572,11 @@ def simulate(hist, horizon_h, gap_mul, grow_mul, haz_mul):
         if t_now < nxt <= t_end:
             f = (nxt - t_now) / 3600.0
             progress(f)
-            if hist.n_fit is not None and hist.w_n > 0:
+            if hist.weibull is not None and hist.w_n > 0:
+                wk, wth, wninf, wn0 = hist.weibull
                 hrs = max(0.0, (nxt - hist.release.timestamp()) / 3600.0)
-                n_fit = math.exp(hist.n_fit[0] + hist.n_fit[1] * math.log1p(hrs))
-                ratio_fit = clamp(n_fit / n_cur, 1.0, 5.0) if n_cur > 0 else 1.0
+                n_w = wn0 + wninf * (1.0 - math.exp(-((hrs / wth) ** wk)))
+                ratio_fit = clamp(n_w / n_cur, 1.0, 5.0) if n_cur > 0 else 1.0
             else:
                 ratio_fit = None
             idx = min(jump_idx, len(prior_ratios) - 1)
@@ -537,9 +587,25 @@ def simulate(hist, horizon_h, gap_mul, grow_mul, haz_mul):
             else:
                 ratio = ratio_prior
             ratio = 1.0 + (ratio - 1.0) * grow_mul
-            # The ceiling is the Weibull saturation level (60k). The first
-            # refresh is a spec fact (6.06x), not an extrapolation, so it
-            # is exempt from the cap check; later jumps are capped.
+            # A jump may not take N above the fitted Weibull curve at
+            # that refresh time. The blend above chases the curve from
+            # below (the fitted ratio is the whole remaining growth to
+            # the curve, the prior ratio is a per-step rate), so without
+            # this the prior component keeps adding ~10% per refresh
+            # even after N has passed the curve -- the first version of
+            # this fix overshot N_target to the asymptote (~51k) that
+            # way. The first refresh is a spec fact (6.06x) and sits
+            # on the curve by construction, so the cap never binds
+            # there. The asymptote cap below stays as a backstop.
+            if hist.weibull is not None and n_cur > 0:
+                wk, wth, wninf, wn0 = hist.weibull
+                hrs = max(0.0, (nxt - hist.release.timestamp()) / 3600.0)
+                n_w = wn0 + wninf * (1.0 - math.exp(-((hrs / wth) ** wk)))
+                if n_cur * ratio > n_w:
+                    ratio = n_w / n_cur
+            # The ceiling is the fitted Weibull saturation level. The
+            # first refresh is a spec fact (6.06x), not an extrapolation,
+            # so it is exempt from the cap check; later jumps are capped.
             if first_jump_done and n_cur * ratio > n_cap:
                 ratio = n_cap / n_cur if n_cur > 0 else 1.0
             if ratio > 1.0:
